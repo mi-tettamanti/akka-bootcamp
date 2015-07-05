@@ -62,13 +62,13 @@ namespace GithubActors.Actors
 
         #endregion
 
-        private IActorRef _githubWorker;
+        private IActorRef githubWorker;
 
-        private RepoKey _currentRepo;
-        private Dictionary<string, SimilarRepo> _similarRepos;
-        private HashSet<IActorRef> _subscribers;
-        private ICancelable _publishTimer;
-        private GithubProgressStats _githubProgressStats;
+        private RepoKey currentRepo;
+        private Dictionary<string, SimilarRepo> similarRepos;
+        private HashSet<IActorRef> subscribers;
+        private ICancelable publishTimer;
+        private GithubProgressStats githubProgressStats;
 
         private bool _receivedInitialUsers = false;
 
@@ -79,7 +79,8 @@ namespace GithubActors.Actors
 
         protected override void PreStart()
         {
-            _githubWorker = Context.ActorOf(Props.Create(() => new GithubWorkerActor(GithubClientFactory.GetClient)));
+            githubWorker = Context.ActorOf(Props.Create(() => new GithubWorkerActor(GithubClientFactory.GetClient))
+                .WithRouter(new RoundRobinPool(10)));
         }
 
         private void Waiting()
@@ -90,25 +91,25 @@ namespace GithubActors.Actors
                 BecomeWorking(job.Repo);
 
                 //kick off the job to query the repo's list of starrers
-                _githubWorker.Tell(new RetryableQuery(new GithubWorkerActor.QueryStarrers(job.Repo), 4));
+                githubWorker.Tell(new RetryableQuery(new GithubWorkerActor.QueryStarrers(job.Repo), 4));
             });
         }
 
         private void BecomeWorking(RepoKey repo)
         {
             _receivedInitialUsers = false;
-            _currentRepo = repo;
-            _subscribers = new HashSet<IActorRef>();
-            _similarRepos = new Dictionary<string, SimilarRepo>();
-            _publishTimer = new Cancelable(Context.System.Scheduler);
-            _githubProgressStats = new GithubProgressStats();
+            currentRepo = repo;
+            subscribers = new HashSet<IActorRef>();
+            similarRepos = new Dictionary<string, SimilarRepo>();
+            publishTimer = new Cancelable(Context.System.Scheduler);
+            githubProgressStats = new GithubProgressStats();
             Become(Working);
         }
 
         private void BecomeWaiting()
         {
             //stop publishing
-            _publishTimer.Cancel();
+            publishTimer.Cancel();
             Become(Waiting);
         }
 
@@ -117,39 +118,39 @@ namespace GithubActors.Actors
             //received a downloaded user back from the github worker
             Receive<GithubWorkerActor.StarredReposForUser>(user =>
             {
-                _githubProgressStats = _githubProgressStats.UserQueriesFinished();
+                githubProgressStats = githubProgressStats.UserQueriesFinished();
                 foreach (var repo in user.Repos)
                 {
-                    if (!_similarRepos.ContainsKey(repo.HtmlUrl))
+                    if (!similarRepos.ContainsKey(repo.HtmlUrl))
                     {
-                        _similarRepos[repo.HtmlUrl] = new SimilarRepo(repo);
+                        similarRepos[repo.HtmlUrl] = new SimilarRepo(repo);
                     }
 
                     //increment the number of people who starred this repo
-                    _similarRepos[repo.HtmlUrl].SharedStarrers++;
+                    similarRepos[repo.HtmlUrl].SharedStarrers++;
                 }
             });
 
             Receive<PublishUpdate>(update =>
             {
                 //check to see if the job is done
-                if (_receivedInitialUsers && _githubProgressStats.IsFinished)
+                if (_receivedInitialUsers && githubProgressStats.IsFinished)
                 {
-                    _githubProgressStats = _githubProgressStats.Finish();
+                    githubProgressStats = githubProgressStats.Finish();
 
                     //all repos minus forks of the current one
-                    var sortedSimilarRepos = _similarRepos.Values
-                        .Where(x => x.Repo.Name != _currentRepo.Repo).OrderByDescending(x => x.SharedStarrers).ToList();
-                    foreach (var subscriber in _subscribers)
+                    var sortedSimilarRepos = similarRepos.Values
+                        .Where(x => x.Repo.Name != currentRepo.Repo).OrderByDescending(x => x.SharedStarrers).ToList();
+                    foreach (var subscriber in subscribers)
                     {
                         subscriber.Tell(sortedSimilarRepos);
                     }
                     BecomeWaiting();
                 }
 
-                foreach (var subscriber in _subscribers)
+                foreach (var subscriber in subscribers)
                 {
-                    subscriber.Tell(_githubProgressStats);
+                    subscriber.Tell(githubProgressStats);
                 }
             });
 
@@ -157,11 +158,11 @@ namespace GithubActors.Actors
             Receive<User[]>(users =>
             {
                 _receivedInitialUsers = true;
-                _githubProgressStats = _githubProgressStats.SetExpectedUserCount(users.Length);
+                githubProgressStats = githubProgressStats.SetExpectedUserCount(users.Length);
 
                 //queue up all of the jobs
                 foreach (var user in users)
-                    _githubWorker.Tell(new RetryableQuery(new GithubWorkerActor.QueryStarrer(user.Login), 3));
+                    githubWorker.Tell(new RetryableQuery(new GithubWorkerActor.QueryStarrer(user.Login), 3));
             });
 
             Receive<GithubCommanderActor.CanAcceptJob>(job => Sender.Tell(new GithubCommanderActor.UnableToAcceptJob(job.Repo)));
@@ -169,31 +170,31 @@ namespace GithubActors.Actors
             Receive<SubscribeToProgressUpdates>(updates =>
             {
                 //this is our first subscriber, which means we need to turn publishing on
-                if (_subscribers.Count == 0)
+                if (subscribers.Count == 0)
                 {
                     Context.System.Scheduler.ScheduleTellRepeatedly(TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(100),
-                        Self, PublishUpdate.Instance, Self, _publishTimer);
+                        Self, PublishUpdate.Instance, Self, publishTimer);
                 }
 
-                _subscribers.Add(updates.Subscriber);
+                subscribers.Add(updates.Subscriber);
             });
 
             //query failed, but can be retried
-            Receive<RetryableQuery>(query => query.CanRetry, query => _githubWorker.Tell(query));
+            Receive<RetryableQuery>(query => query.CanRetry, query => githubWorker.Tell(query));
 
             //query failed, can't be retried, and it's a QueryStarrers operation - means the entire job failed
             Receive<RetryableQuery>(query => !query.CanRetry && query.Query is GithubWorkerActor.QueryStarrers, query =>
             {
                 _receivedInitialUsers = true;
-                foreach (var subscriber in _subscribers)
+                foreach (var subscriber in subscribers)
                 {
-                    subscriber.Tell(new JobFailed(_currentRepo));
+                    subscriber.Tell(new JobFailed(currentRepo));
                 }
                 BecomeWaiting();
             });
 
             //query failed, can't be retried, and it's a QueryStarrers operation - means individual operation failed
-            Receive<RetryableQuery>(query => !query.CanRetry && query.Query is GithubWorkerActor.QueryStarrer, query => _githubProgressStats.IncrementFailures());
+            Receive<RetryableQuery>(query => !query.CanRetry && query.Query is GithubWorkerActor.QueryStarrer, query => githubProgressStats.IncrementFailures());
         }
     }
 }
